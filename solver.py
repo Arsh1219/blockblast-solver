@@ -20,15 +20,29 @@ from scipy import ndimage
 # ---------- Color masks ----------
 
 def brick_mask(arr: np.ndarray) -> np.ndarray:
-    """Orange/red bricks: high R, mid G, low B."""
-    r, g, b = arr[..., 0].astype(int), arr[..., 1].astype(int), arr[..., 2].astype(int)
-    return (r > 170) & (g > 40) & (g < 190) & (b < 110) & (r > b + 60)
+    """Any colored brick: bright + saturated, but not the blue page/grid backdrop.
+
+    Block Blast bricks come in many colors (orange, yellow, green, purple, blue,
+    red, cyan, ...). They share two traits versus the background: high
+    saturation and high value. The page and grid backgrounds are blue-dominant
+    with moderate brightness, so we exclude that band explicitly.
+    """
+    arr_f = arr.astype(np.float32) / 255.0
+    r, g, b = arr_f[..., 0], arr_f[..., 1], arr_f[..., 2]
+    maxc = np.maximum(np.maximum(r, g), b)
+    minc = np.minimum(np.minimum(r, g), b)
+    v = maxc
+    s = np.where(maxc > 1e-6, (maxc - minc) / np.maximum(maxc, 1e-5), 0.0)
+    bright_sat = (v > 0.55) & (s > 0.32)
+    # The page/grid blue backdrop is blue-dominant and not super bright.
+    bluebg = (b > r + 0.10) & (b > g + 0.05) & (v < 0.78)
+    return bright_sat & ~bluebg
 
 
 def grid_bg_mask(arr: np.ndarray) -> np.ndarray:
-    """Dark blue-gray grid background."""
+    """Dark blue-gray grid background (the empty cells inside the play area)."""
     r, g, b = arr[..., 0].astype(int), arr[..., 1].astype(int), arr[..., 2].astype(int)
-    return (r < 90) & (g < 110) & (b > 60) & (b < 140) & (b > r)
+    return (r < 100) & (g < 120) & (b > 55) & (b < 150) & (b > r)
 
 
 # ---------- Grid detection ----------
@@ -114,19 +128,28 @@ def detect_pieces(arr: np.ndarray, gb: GridBounds) -> List[Piece]:
     H, W = arr.shape[:2]
     bm = brick_mask(arr)
 
-    # Restrict to region below the board.
-    region_top = gb.bottom + 20
-    region_bot = min(H, gb.bottom + int((H - gb.bottom) * 0.85))
+    # Restrict to the band immediately below the board. Pieces are at most
+    # ~3 cells tall and sit close to the grid; capping by cell-size keeps ads,
+    # banners, and home-bar UI out of the search.
+    region_top = gb.bottom + max(15, int(gb.cell_h * 0.25))
+    region_bot = min(
+        H,
+        gb.bottom + int(gb.cell_h * 5.5),
+        gb.bottom + int((H - gb.bottom) * 0.7),
+    )
+    if region_bot <= region_top + 10:
+        raise ValueError("No room below the board to detect pieces.")
     region = bm[region_top:region_bot, :].copy()
 
     # Heavy dilation to merge bricks within each piece.
     dilated = ndimage.binary_dilation(region, iterations=10)
     labeled, n = ndimage.label(dilated)
 
+    min_blob = max(500, int((gb.cell_h * 0.6) ** 2))
     comps = []
     for i in range(1, n + 1):
         mask = (labeled == i)
-        if mask.sum() < 500:        # ignore noise
+        if mask.sum() < min_blob:        # ignore noise / tiny ad icons
             continue
         ys, xs = np.where(mask)
         comps.append((int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())))
@@ -134,9 +157,17 @@ def detect_pieces(arr: np.ndarray, gb: GridBounds) -> List[Piece]:
     if len(comps) < 3:
         raise ValueError(f"Expected 3 pieces below the board, found {len(comps)}.")
 
-    # Sort left to right; if more than 3, keep the 3 largest by area.
+    # If we have stragglers, keep the three largest that share a horizontal
+    # band (pieces sit on roughly the same row).
     comps.sort(key=lambda c: (c[2] - c[0]) * (c[3] - c[1]), reverse=True)
-    comps = comps[:3]
+    if len(comps) > 3:
+        ycs = sorted((c[1] + c[3]) / 2 for c in comps[:6])
+        median_y = ycs[len(ycs) // 2]
+        tol = gb.cell_h * 1.5
+        aligned = [c for c in comps if abs((c[1] + c[3]) / 2 - median_y) < tol]
+        comps = (aligned if len(aligned) >= 3 else comps)[:3]
+    else:
+        comps = comps[:3]
     comps.sort(key=lambda c: c[0])  # left to right
 
     # Find a single cell size that fits all three pieces' bboxes well.
