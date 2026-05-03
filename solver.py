@@ -19,28 +19,73 @@ from scipy import ndimage
 
 # ---------- Color masks ----------
 
-def brick_mask(arr: np.ndarray) -> np.ndarray:
-    """Any colored brick: bright + saturated, but not the blue page/grid backdrop.
+def _mode_color(pixels: np.ndarray, q: int = 16) -> np.ndarray:
+    """Quantize pixels to bins of size `q` per channel and return the modal color."""
+    if pixels.size == 0:
+        return np.array([0, 0, 0], dtype=np.int32)
+    p = pixels.astype(np.int32)
+    qp = (p // q) * q
+    keys = qp[:, 0] * (256 * 256) + qp[:, 1] * 256 + qp[:, 2]
+    vals, counts = np.unique(keys, return_counts=True)
+    mode_key = vals[int(np.argmax(counts))]
+    r = (mode_key // (256 * 256)) & 0xFF
+    g = (mode_key // 256) & 0xFF
+    b = mode_key & 0xFF
+    # Refine: take the mean of the pixels in the modal bin.
+    in_bin = (qp[:, 0] == r) & (qp[:, 1] == g) & (qp[:, 2] == b)
+    if in_bin.any():
+        return p[in_bin].mean(axis=0).astype(np.int32)
+    return np.array([r, g, b], dtype=np.int32)
 
-    Block Blast bricks come in many colors (orange, yellow, green, purple, blue,
-    red, cyan, ...). They share two traits versus the background: high
-    saturation and high value. The page and grid backgrounds are blue-dominant
-    with moderate brightness, so we exclude that band explicitly.
+
+def estimate_page_bg(arr: np.ndarray) -> tuple[np.ndarray, int]:
+    """Estimate the page background color (and a per-image tolerance) from image edges.
+
+    Block Blast themes vary (blue, brown, pink, dark, ...). The play area is
+    centered, so the *left and right edges* of the screenshot are almost
+    always pure page background. We sample narrow vertical strips, take the
+    modal color, and derive a tolerance from how much the sampled pixels
+    deviate from that mode (small for solid backgrounds, larger for noisy
+    or gradient backgrounds).
     """
+    H, W = arr.shape[:2]
+    edge_w = max(15, int(W * 0.04))
+    y0 = max(20, int(H * 0.05))
+    y1 = H - max(20, int(H * 0.08))
+    if y1 <= y0:
+        y0, y1 = 0, H
+    left = arr[y0:y1, :edge_w]
+    right = arr[y0:y1, W - edge_w:]
+    pixels = np.concatenate([left.reshape(-1, 3), right.reshape(-1, 3)], axis=0)
+    bg = _mode_color(pixels, q=16)
+    # Tolerance: large enough to absorb edge antialiasing / JPEG noise,
+    # small enough to flag a subtly-different grid background (e.g., dark
+    # themes where grid and page differ by only ~30 in value).
+    diffs = np.abs(pixels.astype(np.int32) - bg).max(axis=-1)
+    tol = int(np.percentile(diffs, 98)) + 12
+    tol = max(18, min(tol, 45))
+    return bg, tol
+
+
+def page_bg_mask(arr: np.ndarray, page_bg: np.ndarray, tol: int = 38) -> np.ndarray:
+    """True where pixels are close to the sampled page background color."""
+    diff = np.abs(arr.astype(np.int32) - page_bg).max(axis=-1)
+    return diff < tol
+
+
+def brick_mask(arr: np.ndarray) -> np.ndarray:
+    """Bright + saturated colored brick (kept for back-compat / fallback uses)."""
     arr_f = arr.astype(np.float32) / 255.0
     r, g, b = arr_f[..., 0], arr_f[..., 1], arr_f[..., 2]
     maxc = np.maximum(np.maximum(r, g), b)
     minc = np.minimum(np.minimum(r, g), b)
     v = maxc
     s = np.where(maxc > 1e-6, (maxc - minc) / np.maximum(maxc, 1e-5), 0.0)
-    bright_sat = (v > 0.55) & (s > 0.32)
-    # The page/grid blue backdrop is blue-dominant and not super bright.
-    bluebg = (b > r + 0.10) & (b > g + 0.05) & (v < 0.78)
-    return bright_sat & ~bluebg
+    return (v > 0.55) & (s > 0.32)
 
 
 def grid_bg_mask(arr: np.ndarray) -> np.ndarray:
-    """Dark blue-gray grid background (the empty cells inside the play area)."""
+    """Legacy blue grid-bg mask. Kept for back-compat; new pipeline doesn't rely on it."""
     r, g, b = arr[..., 0].astype(int), arr[..., 1].astype(int), arr[..., 2].astype(int)
     return (r < 100) & (g < 120) & (b > 55) & (b < 150) & (b > r)
 
@@ -67,48 +112,85 @@ class GridBounds:
 
 def detect_grid_bounds(arr: np.ndarray, grid_size: int = 8) -> GridBounds:
     """Find the playing grid's bounding box.
-    Strategy: union of grid-bg and brick pixels, take the largest connected component
-    in the upper portion of the image, take its bounding box.
+
+    Theme-agnostic strategy:
+      1. Estimate the page background color from the image corners.
+      2. Mark every pixel that's *not* the page background (this includes the
+         grid's interior background and every brick).
+      3. The grid is the largest connected blob of "not page background" in
+         the upper portion of the image.
+      4. Take that blob's bounding box.
+
+    This works whether the page is blue, brown, pink, dark, etc.
     """
     H, W = arr.shape[:2]
-    combined = grid_bg_mask(arr) | brick_mask(arr)
+    page_bg, tol = estimate_page_bg(arr)
 
-    # Restrict to upper 75% to avoid the pieces region.
-    upper = combined.copy()
-    upper[int(H * 0.75):, :] = False
+    not_page = ~page_bg_mask(arr, page_bg, tol=tol)
+    # Trim a status-bar strip at the very top and the lower portion (pieces / ads).
+    not_page[:max(8, int(H * 0.025)), :] = False
+    not_page[int(H * 0.78):, :] = False
 
-    # Dilate to merge small gaps.
-    upper = ndimage.binary_dilation(upper, iterations=3)
+    # Dilate so brick pixels merge with their surrounding grid background and
+    # form a single big blob roughly equal to the grid rectangle.
+    dilated = ndimage.binary_dilation(not_page, iterations=4)
 
-    labeled, n = ndimage.label(upper)
+    labeled, n = ndimage.label(dilated)
     if n == 0:
         raise ValueError("Could not detect grid in image.")
 
-    # Pick the largest component by area.
-    sizes = ndimage.sum(upper, labeled, range(1, n + 1))
+    sizes = ndimage.sum(dilated, labeled, range(1, n + 1))
     biggest = int(np.argmax(sizes)) + 1
 
     coords = np.argwhere(labeled == biggest)
     ymin, xmin = coords.min(axis=0)
     ymax, xmax = coords.max(axis=0)
 
+    # Sanity check: the grid blob should be roughly square-ish and big.
+    bw, bh = xmax - xmin, ymax - ymin
+    if bw < W * 0.4 or bh < H * 0.2:
+        raise ValueError("Detected grid blob is too small; image may be cropped.")
+
     return GridBounds(top=int(ymin), bottom=int(ymax), left=int(xmin), right=int(xmax),
                       rows=grid_size, cols=grid_size)
 
 
+def _estimate_grid_bg(arr: np.ndarray, gb: GridBounds) -> np.ndarray:
+    """Estimate the empty-cell background color from inside the grid rectangle.
+
+    The grid interior contains exactly two kinds of pixels: grid background
+    (a single flat dark color) and bricks (various saturated colors). Even
+    on densely-packed boards, the grid-bg color dominates the per-bin
+    histogram because it's one color while bricks are split across many.
+    We take the modal quantized color.
+    """
+    pad_y = max(2, int(gb.cell_h * 0.05))
+    pad_x = max(2, int(gb.cell_w * 0.05))
+    interior = arr[max(0, gb.top + pad_y):gb.bottom - pad_y + 1,
+                   max(0, gb.left + pad_x):gb.right - pad_x + 1]
+    if interior.size == 0:
+        return np.array([0, 0, 0], dtype=np.int32)
+    return _mode_color(interior.reshape(-1, 3), q=16)
+
+
 def read_grid_state(arr: np.ndarray, gb: GridBounds) -> List[List[int]]:
-    """Sample each cell center, decide filled if enough brick pixels."""
-    bm = brick_mask(arr)
+    """Sample each cell center; mark filled if it differs from the grid background."""
+    grid_bg = _estimate_grid_bg(arr, gb)
     grid: List[List[int]] = []
-    sample = max(8, int(min(gb.cell_h, gb.cell_w) * 0.25))
+    sample = max(6, int(min(gb.cell_h, gb.cell_w) * 0.18))
+    arr_i = arr.astype(np.int32)
     for r in range(gb.rows):
         row: List[int] = []
         for c in range(gb.cols):
             cy = int(gb.top + (r + 0.5) * gb.cell_h)
             cx = int(gb.left + (c + 0.5) * gb.cell_w)
-            patch = bm[max(0, cy - sample):cy + sample, max(0, cx - sample):cx + sample]
-            ratio = patch.mean() if patch.size else 0.0
-            row.append(1 if ratio > 0.25 else 0)
+            patch = arr_i[max(0, cy - sample):cy + sample,
+                          max(0, cx - sample):cx + sample]
+            if patch.size == 0:
+                row.append(0); continue
+            mean_color = patch.reshape(-1, 3).mean(axis=0)
+            diff = float(np.max(np.abs(mean_color - grid_bg)))
+            row.append(1 if diff > 35 else 0)
         grid.append(row)
     return grid
 
@@ -126,7 +208,11 @@ class Piece:
 def detect_pieces(arr: np.ndarray, gb: GridBounds) -> List[Piece]:
     """Find 3 piece bounding boxes below the grid, then read each piece's cell pattern."""
     H, W = arr.shape[:2]
-    bm = brick_mask(arr)
+    page_bg, tol = estimate_page_bg(arr)
+    # "Brick" anywhere on the page = anything that isn't page background.
+    # In the piece tray (no grid background to confuse us), this cleanly isolates
+    # the colored shapes regardless of theme.
+    not_page_full = ~page_bg_mask(arr, page_bg, tol=tol)
 
     # Restrict to the band immediately below the board. Pieces are at most
     # ~3 cells tall and sit close to the grid; capping by cell-size keeps ads,
@@ -139,17 +225,17 @@ def detect_pieces(arr: np.ndarray, gb: GridBounds) -> List[Piece]:
     )
     if region_bot <= region_top + 10:
         raise ValueError("No room below the board to detect pieces.")
-    region = bm[region_top:region_bot, :].copy()
+    region = not_page_full[region_top:region_bot, :].copy()
 
-    # Heavy dilation to merge bricks within each piece.
-    dilated = ndimage.binary_dilation(region, iterations=10)
+    # Moderate dilation to merge bricks within each piece (don't merge across pieces).
+    dilated = ndimage.binary_dilation(region, iterations=8)
     labeled, n = ndimage.label(dilated)
 
-    min_blob = max(500, int((gb.cell_h * 0.6) ** 2))
+    min_blob = max(400, int((gb.cell_h * 0.55) ** 2))
     comps = []
     for i in range(1, n + 1):
         mask = (labeled == i)
-        if mask.sum() < min_blob:        # ignore noise / tiny ad icons
+        if mask.sum() < min_blob:
             continue
         ys, xs = np.where(mask)
         comps.append((int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())))
@@ -157,33 +243,31 @@ def detect_pieces(arr: np.ndarray, gb: GridBounds) -> List[Piece]:
     if len(comps) < 3:
         raise ValueError(f"Expected 3 pieces below the board, found {len(comps)}.")
 
-    # If we have stragglers, keep the three largest that share a horizontal
-    # band (pieces sit on roughly the same row).
+    # Pieces sit on roughly the same horizontal band; reject blobs whose
+    # vertical center is far from the others (e.g., an ad banner deeper down).
     comps.sort(key=lambda c: (c[2] - c[0]) * (c[3] - c[1]), reverse=True)
-    if len(comps) > 3:
-        ycs = sorted((c[1] + c[3]) / 2 for c in comps[:6])
-        median_y = ycs[len(ycs) // 2]
-        tol = gb.cell_h * 1.5
-        aligned = [c for c in comps if abs((c[1] + c[3]) / 2 - median_y) < tol]
-        comps = (aligned if len(aligned) >= 3 else comps)[:3]
-    else:
-        comps = comps[:3]
+    pool = comps[:8]
+    ycs = sorted((c[1] + c[3]) / 2 for c in pool)
+    median_y = ycs[len(ycs) // 2]
+    tol = max(gb.cell_h * 1.5, 60)
+    aligned = [c for c in pool if abs((c[1] + c[3]) / 2 - median_y) < tol]
+    comps = (aligned if len(aligned) >= 3 else pool)[:3]
     comps.sort(key=lambda c: c[0])  # left to right
 
-    # Find a single cell size that fits all three pieces' bboxes well.
-    # Cell sizes are tested as fractions of the smaller piece dimensions.
+    # Cell-size search: try a wide range and pick the size that makes every
+    # piece's bbox closest to an integer number of cells in both dimensions.
     raw_dims = [(x1 - x0 + 1, y1 - y0 + 1) for (x0, y0, x1, y1) in comps]
-    # Strip dilation padding (we expanded by ~10 px each side).
-    raw_dims = [(max(1, w - 16), max(1, h - 16)) for (w, h) in raw_dims]
+    # Strip dilation padding (we expanded by ~8 px each side).
+    raw_dims = [(max(1, w - 14), max(1, h - 14)) for (w, h) in raw_dims]
 
     best_cs, best_err = None, float("inf")
-    for cs in range(20, 70):
+    for cs in range(18, 90):
         err = 0.0
         ok = True
         for (w, h) in raw_dims:
             cw = w / cs
             ch = h / cs
-            if cw < 0.7 or ch < 0.7 or cw > 5 or ch > 5:
+            if cw < 0.7 or ch < 0.7 or cw > 5.5 or ch > 5.5:
                 ok = False; break
             err += (cw - round(cw)) ** 2 + (ch - round(ch)) ** 2
         if ok and err < best_err:
@@ -193,13 +277,12 @@ def detect_pieces(arr: np.ndarray, gb: GridBounds) -> List[Piece]:
 
     pieces: List[Piece] = []
     for idx, (x0, y0, x1, y1) in enumerate(comps):
-        # Use original (un-dilated) brick pixels inside this piece.
+        # Use original (un-dilated) not-page pixels inside this piece's bbox.
         ay0 = region_top + y0
         ay1 = region_top + y1
-        sub = bm[ay0:ay1 + 1, x0:x1 + 1]
+        sub = not_page_full[ay0:ay1 + 1, x0:x1 + 1]
 
-        # Strip outer dilation buffer from bbox to recover true bounds.
-        # Find tightest bbox of true brick pixels inside.
+        # Tight bbox around the true (un-dilated) piece pixels.
         ys, xs = np.where(sub)
         if len(ys) == 0:
             continue
@@ -211,16 +294,16 @@ def detect_pieces(arr: np.ndarray, gb: GridBounds) -> List[Piece]:
         rows = max(1, round(ph / best_cs))
         cols = max(1, round(pw / best_cs))
 
-        cell_h = ph / rows
-        cell_w = pw / cols
+        cell_h_p = ph / rows
+        cell_w_p = pw / cols
 
         cells: List[Tuple[int, int]] = []
         for r in range(rows):
             for c in range(cols):
-                cy0 = int(r * cell_h + cell_h * 0.25)
-                cy1 = int(r * cell_h + cell_h * 0.75)
-                cx0 = int(c * cell_w + cell_w * 0.25)
-                cx1 = int(c * cell_w + cell_w * 0.75)
+                cy0 = int(r * cell_h_p + cell_h_p * 0.25)
+                cy1 = int(r * cell_h_p + cell_h_p * 0.75)
+                cx0 = int(c * cell_w_p + cell_w_p * 0.25)
+                cx1 = int(c * cell_w_p + cell_w_p * 0.75)
                 patch = sub[cy0:cy1 + 1, cx0:cx1 + 1]
                 if patch.size and patch.mean() > 0.4:
                     cells.append((r, c))
