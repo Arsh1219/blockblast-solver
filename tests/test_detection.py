@@ -254,6 +254,71 @@ def run_grid_size(theme: str, n: int) -> None:
     print(f"  grid {n}x{n}: OK")
 
 
+def run_piece_count(theme: str, count: int) -> None:
+    print(f"\n--- {theme}, {count} piece(s) in tray ---")
+    board = [[(r * 13 + c * 7) % 5 == 0 for c in range(8)] for r in range(8)]
+    all_pieces = [
+        [[1, 1], [1, 0]],            # L (3 cells)
+        [[1, 1, 1, 1]],              # 1x4
+        [[1, 1, 1], [1, 1, 1], [1, 1, 1]],  # 3x3
+    ]
+    pieces_input = all_pieces[:count]
+    img, _ = make_screenshot(theme, board, pieces_input)
+    arr = np.array(img)
+    bounds = solver.detect_grid_bounds(arr, grid_size=8)
+    detected_board = solver.read_grid_state(arr, bounds)
+    if detected_board != board:
+        raise AssertionError(f"{count}-piece on {theme}: board mismatch")
+    pieces = solver.detect_pieces(arr, bounds)
+    if len(pieces) != count:
+        raise AssertionError(f"{count}-piece on {theme}: detected {len(pieces)}")
+    print(f"  {count} pieces: detected OK")
+
+    sol = solver.solve(detected_board, pieces)
+    if sol is None and count > 0:
+        raise AssertionError(f"{count}-piece on {theme}: solver returned None unexpectedly")
+    if sol is not None:
+        n_placed = len(sol.moves)
+        n_unplaced = len(sol.unplaced)
+        print(f"  solve: placed {n_placed}/{count}, "
+              f"clears={sol.line_clears}, unplaced={n_unplaced}")
+
+
+def run_partial_fit() -> None:
+    """An unwinnable scenario: two 3x3 pieces, only one 3x3 region available,
+    and placing it does NOT trigger any line clear."""
+    print("\n--- partial-fit (two 3x3, single 3x3 region, no line clears) ---")
+    # Top-left 3x3 is the only empty 3x3 region. Surrounding rows/cols are
+    # left short of full so placing the piece never completes a line, and the
+    # post-placement layout has no other 3x3 empty area.
+    board = [
+        [0, 0, 0, 1, 0, 0, 0, 0],
+        [0, 0, 0, 1, 1, 1, 1, 0],
+        [0, 0, 0, 1, 1, 1, 1, 0],
+        [1, 1, 1, 1, 1, 1, 1, 0],
+        [1, 1, 1, 1, 1, 1, 1, 0],
+        [0, 1, 1, 1, 1, 1, 1, 0],
+        [1, 0, 1, 1, 1, 1, 1, 0],
+        [1, 1, 0, 1, 1, 1, 1, 0],
+    ]
+
+    pieces = [
+        solver.Piece(name="P1", cells=[(r, c) for r in range(3) for c in range(3)],
+                     height=3, width=3),
+        solver.Piece(name="P2", cells=[(r, c) for r in range(3) for c in range(3)],
+                     height=3, width=3),
+    ]
+    sol = solver.solve(board, pieces)
+    if sol is None:
+        raise AssertionError("partial-fit: expected best-partial solution, got None")
+    if len(sol.moves) != 1 or len(sol.unplaced) != 1:
+        raise AssertionError(
+            f"partial-fit: expected 1 placed + 1 unplaced, got "
+            f"{len(sol.moves)} placed + {len(sol.unplaced)} unplaced"
+        )
+    print(f"  partial-fit: placed 1/2, unplaced 1, clears={sol.line_clears}")
+
+
 def main() -> int:
     failures = []
 
@@ -282,6 +347,22 @@ def main() -> int:
             except AssertionError as e:
                 failures.append((f"grid:{theme}:{n}", str(e)))
                 print(f"  FAILED: {e}")
+
+    # Piece-count sweep (1, 2, 3 pieces in tray)
+    for theme in ("blue", "brown"):
+        for count in (1, 2, 3):
+            try:
+                run_piece_count(theme, count)
+            except AssertionError as e:
+                failures.append((f"count:{theme}:{count}", str(e)))
+                print(f"  FAILED: {e}")
+
+    # Partial-fit solver behavior
+    try:
+        run_partial_fit()
+    except AssertionError as e:
+        failures.append(("partial-fit", str(e)))
+        print(f"  FAILED: {e}")
 
     print()
     if failures:

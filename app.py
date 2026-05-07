@@ -52,23 +52,41 @@ with st.spinner("Detecting board and solving..."):
         analysis = solver.analyze_image(pil, grid_size=grid_size)
     except Exception as e:
         st.error(f"Couldn't parse the screenshot: {e}")
-        st.info("Tips: make sure the full grid and all three pieces are in frame, "
-                "and that the image isn't cropped or zoomed.")
+        st.info("Tips: make sure the full grid and the available pieces (1-3) are in "
+                "frame, and that the image isn't cropped or zoomed.")
         st.stop()
 
 with col2:
     st.subheader("Solution")
     if analysis.solution is None:
-        st.error("No valid placement found — these three pieces don't fit on this board.")
+        st.error("None of the detected pieces fit anywhere on this board.")
     else:
         sol = analysis.solution
         clears = sol.line_clears
+        n_placed = len(sol.moves)
+        n_total = n_placed + len(sol.unplaced)
         emoji = "🎯" if clears >= 2 else ("✨" if clears == 1 else "✅")
-        st.success(f"{emoji} Found a solution with **{clears} line clear{'s' if clears != 1 else ''}**.")
+        clear_word = f"{clears} line clear{'s' if clears != 1 else ''}"
+
+        if sol.all_placed:
+            st.success(f"{emoji} Placed all {n_placed} piece{'s' if n_placed != 1 else ''} "
+                       f"with **{clear_word}**.")
+        else:
+            unplaced_names = ", ".join(p.name for p in sol.unplaced)
+            st.warning(
+                f"⚠️ Could only fit **{n_placed} of {n_total}** pieces "
+                f"({clear_word}). Pieces that don't fit: **{unplaced_names}**. "
+                f"In Block Blast, this typically means the round is unwinnable — "
+                f"play this best-partial placement to maximise score before the game ends."
+            )
 
         st.markdown("**Placement order (rows and columns are 0-indexed from top-left):**")
         for i, m in enumerate(sol.moves, start=1):
             st.markdown(f"{i}. Place **{m.piece.name}** at **row {m.row}, col {m.col}**")
+        if sol.unplaced:
+            st.markdown("**Unplaced pieces (no legal placement):**")
+            for p in sol.unplaced:
+                st.markdown(f"- **{p.name}** ({p.height}×{p.width}, {len(p.cells)} cells)")
 
         # Render preview
         preview = solver.render_solution(analysis.board, sol)

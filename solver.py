@@ -206,7 +206,12 @@ class Piece:
 
 
 def detect_pieces(arr: np.ndarray, gb: GridBounds) -> List[Piece]:
-    """Find 3 piece bounding boxes below the grid, then read each piece's cell pattern."""
+    """Find 1-3 piece bounding boxes below the grid, then read each piece's cell pattern.
+
+    Block Blast hands you up to three pieces at a time. After you place one,
+    the tray shows fewer until a new triple is generated, so detection must
+    accept any count from 1 to 3 (not exactly 3).
+    """
     H, W = arr.shape[:2]
     page_bg, tol = estimate_page_bg(arr)
     # "Brick" anywhere on the page = anything that isn't page background.
@@ -231,7 +236,7 @@ def detect_pieces(arr: np.ndarray, gb: GridBounds) -> List[Piece]:
     dilated = ndimage.binary_dilation(region, iterations=8)
     labeled, n = ndimage.label(dilated)
 
-    min_blob = max(400, int((gb.cell_h * 0.55) ** 2))
+    min_blob = max(400, int((gb.cell_h * 0.5) ** 2))
     comps = []
     for i in range(1, n + 1):
         mask = (labeled == i)
@@ -240,28 +245,32 @@ def detect_pieces(arr: np.ndarray, gb: GridBounds) -> List[Piece]:
         ys, xs = np.where(mask)
         comps.append((int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())))
 
-    if len(comps) < 3:
-        raise ValueError(f"Expected 3 pieces below the board, found {len(comps)}.")
+    if not comps:
+        raise ValueError("No pieces found below the board.")
 
-    # Pieces sit on roughly the same horizontal band; reject blobs whose
-    # vertical center is far from the others (e.g., an ad banner deeper down).
-    comps.sort(key=lambda c: (c[2] - c[0]) * (c[3] - c[1]), reverse=True)
-    pool = comps[:8]
-    ycs = sorted((c[1] + c[3]) / 2 for c in pool)
-    median_y = ycs[len(ycs) // 2]
-    tol = max(gb.cell_h * 1.5, 60)
-    aligned = [c for c in pool if abs((c[1] + c[3]) / 2 - median_y) < tol]
-    comps = (aligned if len(aligned) >= 3 else pool)[:3]
-    comps.sort(key=lambda c: c[0])  # left to right
+    # The piece tray sits closer to the grid than any ad / banner. Cluster
+    # components by vertical position and keep only the topmost cluster.
+    top_y = min((c[1] + c[3]) / 2 for c in comps)
+    band_tol = max(gb.cell_h * 1.5, 60)
+    piece_band = [c for c in comps if (c[1] + c[3]) / 2 - top_y < band_tol]
 
-    # Cell-size search: try a wide range and pick the size that makes every
-    # piece's bbox closest to an integer number of cells in both dimensions.
-    raw_dims = [(x1 - x0 + 1, y1 - y0 + 1) for (x0, y0, x1, y1) in comps]
-    # Strip dilation padding (we expanded by ~8 px each side).
+    # Keep at most 3 pieces. If we somehow detected more (rare; usually a
+    # piece's halo split into two blobs), prefer the largest by area.
+    if len(piece_band) > 3:
+        piece_band.sort(key=lambda c: (c[2] - c[0]) * (c[3] - c[1]), reverse=True)
+        piece_band = piece_band[:3]
+    piece_band.sort(key=lambda c: c[0])  # left to right
+
+    # Cell-size search: try a range bracketed by the grid's own cell size
+    # (pieces in the tray are typically 0.4-0.85x the grid cell size) and pick
+    # the size that makes every piece's bbox closest to an integer cell count.
+    raw_dims = [(x1 - x0 + 1, y1 - y0 + 1) for (x0, y0, x1, y1) in piece_band]
     raw_dims = [(max(1, w - 14), max(1, h - 14)) for (w, h) in raw_dims]
+    cs_min = max(12, int(gb.cell_h * 0.30))
+    cs_max = max(cs_min + 1, int(gb.cell_h * 0.95))
 
     best_cs, best_err = None, float("inf")
-    for cs in range(18, 90):
+    for cs in range(cs_min, cs_max + 1):
         err = 0.0
         ok = True
         for (w, h) in raw_dims:
@@ -276,7 +285,7 @@ def detect_pieces(arr: np.ndarray, gb: GridBounds) -> List[Piece]:
         raise ValueError("Could not determine piece cell size.")
 
     pieces: List[Piece] = []
-    for idx, (x0, y0, x1, y1) in enumerate(comps):
+    for idx, (x0, y0, x1, y1) in enumerate(piece_band):
         # Use original (un-dilated) not-page pixels inside this piece's bbox.
         ay0 = region_top + y0
         ay1 = region_top + y1
@@ -309,9 +318,13 @@ def detect_pieces(arr: np.ndarray, gb: GridBounds) -> List[Piece]:
                     cells.append((r, c))
 
         if not cells:
-            raise ValueError(f"Piece {idx + 1} appears empty.")
+            continue
 
-        pieces.append(Piece(name=f"P{idx + 1}", cells=cells, height=rows, width=cols))
+        pieces.append(Piece(name=f"P{len(pieces) + 1}", cells=cells,
+                            height=rows, width=cols))
+
+    if not pieces:
+        raise ValueError("Detected piece bounds but couldn't read any cells.")
 
     return pieces
 
@@ -327,9 +340,14 @@ class Move:
 
 @dataclass
 class Solution:
-    moves: List[Move]                     # in placement order
+    moves: List[Move]                     # in placement order (may be < len(pieces))
     line_clears: int
     final_board: List[List[int]]
+    unplaced: List[Piece]                 # pieces that couldn't fit anywhere
+
+    @property
+    def all_placed(self) -> bool:
+        return not self.unplaced
 
 
 def _can_place(board: List[List[int]], piece: Piece, ar: int, ac: int) -> bool:
@@ -367,47 +385,62 @@ def _clear_lines(board: List[List[int]]) -> Tuple[List[List[int]], int]:
 
 
 def solve(board: List[List[int]], pieces: List[Piece]) -> Optional[Solution]:
-    """Return best solution by line-clears, or None if no valid placement exists."""
+    """Return the best placement of as many pieces as possible.
+
+    Tries every order and every placement, applies line clears between moves,
+    and tracks the (most-pieces-placed, most-line-clears) maximum. Returns a
+    Solution with `unplaced` listing any piece that couldn't fit. Returns None
+    only when not even a single piece fits anywhere on the starting board.
+    """
+    if not pieces:
+        return None
     rows, cols = len(board), len(board[0])
-    best: Optional[Solution] = None
 
-    for order in permutations(range(len(pieces))):
-        seq = [pieces[i] for i in order]
-        p1, p2, p3 = seq
+    best = {
+        "placed": -1,
+        "clears": -1,
+        "moves": [],          # type: List[Move]
+        "board": board,
+        "unplaced": list(pieces),
+    }
 
-        for r1 in range(rows - p1.height + 1):
-            for c1 in range(cols - p1.width + 1):
-                if not _can_place(board, p1, r1, c1):
-                    continue
-                b1 = _place(board, p1, r1, c1)
-                b1, k1 = _clear_lines(b1)
+    def update_best(n_placed: int, total_clears: int, moves: List[Move],
+                    curr_board: List[List[int]], remaining: List[Piece]) -> None:
+        if (n_placed > best["placed"] or
+                (n_placed == best["placed"] and total_clears > best["clears"])):
+            best["placed"] = n_placed
+            best["clears"] = total_clears
+            best["moves"] = list(moves)
+            best["board"] = curr_board
+            best["unplaced"] = list(remaining)
 
-                for r2 in range(rows - p2.height + 1):
-                    for c2 in range(cols - p2.width + 1):
-                        if not _can_place(b1, p2, r2, c2):
-                            continue
-                        b2 = _place(b1, p2, r2, c2)
-                        b2, k2 = _clear_lines(b2)
+    def recurse(curr_board: List[List[int]], remaining: List[Piece],
+                placed_moves: List[Move], total_clears: int) -> None:
+        update_best(len(placed_moves), total_clears, placed_moves, curr_board, remaining)
+        if not remaining:
+            return
+        for i, piece in enumerate(remaining):
+            new_remaining = remaining[:i] + remaining[i + 1:]
+            for r in range(rows - piece.height + 1):
+                for c in range(cols - piece.width + 1):
+                    if not _can_place(curr_board, piece, r, c):
+                        continue
+                    nb = _place(curr_board, piece, r, c)
+                    nb, clears = _clear_lines(nb)
+                    placed_moves.append(Move(piece, r, c))
+                    recurse(nb, new_remaining, placed_moves, total_clears + clears)
+                    placed_moves.pop()
 
-                        for r3 in range(rows - p3.height + 1):
-                            for c3 in range(cols - p3.width + 1):
-                                if not _can_place(b2, p3, r3, c3):
-                                    continue
-                                b3 = _place(b2, p3, r3, c3)
-                                b3, k3 = _clear_lines(b3)
+    recurse(board, list(pieces), [], 0)
 
-                                clears = k1 + k2 + k3
-                                if best is None or clears > best.line_clears:
-                                    best = Solution(
-                                        moves=[
-                                            Move(p1, r1, c1),
-                                            Move(p2, r2, c2),
-                                            Move(p3, r3, c3),
-                                        ],
-                                        line_clears=clears,
-                                        final_board=b3,
-                                    )
-    return best
+    if best["placed"] <= 0:
+        return None
+    return Solution(
+        moves=best["moves"],
+        line_clears=best["clears"],
+        final_board=best["board"],
+        unplaced=best["unplaced"],
+    )
 
 
 # ---------- Rendering ----------
