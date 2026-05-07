@@ -284,6 +284,37 @@ def run_piece_count(theme: str, count: int) -> None:
               f"clears={sol.line_clears}, unplaced={n_unplaced}")
 
 
+def run_mixed_size_pieces(theme: str) -> None:
+    """Regression for the bug where 3x3 pieces were read as 2x2 because the
+    cell-size search saw the dilated bbox and picked a larger cs."""
+    print(f"\n--- {theme}, mixed pieces (3x3, L4, 3x3) ---")
+    board = [[(r * 11 + c * 5) % 7 == 0 for c in range(8)] for r in range(8)]
+    pieces_input = [
+        [[1, 1, 1], [1, 1, 1], [1, 1, 1]],   # 3x3 square (9 cells)
+        [[1, 0, 0], [1, 1, 1]],               # L (4 cells)
+        [[1, 1, 1], [1, 1, 1], [1, 1, 1]],   # 3x3 square (9 cells)
+    ]
+    img, _ = make_screenshot(theme, board, pieces_input)
+    arr = np.array(img)
+    bounds = solver.detect_grid_bounds(arr, grid_size=8)
+    detected_board = solver.read_grid_state(arr, bounds)
+    if detected_board != board:
+        raise AssertionError(f"mixed-pieces on {theme}: board mismatch")
+    pieces = solver.detect_pieces(arr, bounds)
+    if len(pieces) != 3:
+        raise AssertionError(f"mixed-pieces on {theme}: detected {len(pieces)}")
+    expected_cell_counts = [9, 4, 9]
+    expected_shapes = [(3, 3), (2, 3), (3, 3)]
+    for i, (p, ec, es) in enumerate(zip(pieces, expected_cell_counts, expected_shapes)):
+        if len(p.cells) != ec or (p.height, p.width) != es:
+            raise AssertionError(
+                f"mixed-pieces on {theme}: piece {i+1} read as "
+                f"{p.height}x{p.width} ({len(p.cells)} cells), expected "
+                f"{es[0]}x{es[1]} ({ec} cells)"
+            )
+    print(f"  mixed-pieces: OK ({[(p.height, p.width, len(p.cells)) for p in pieces]})")
+
+
 def run_partial_fit() -> None:
     """An unwinnable scenario: two 3x3 pieces, only one 3x3 region available,
     and placing it does NOT trigger any line clear."""
@@ -356,6 +387,14 @@ def main() -> int:
             except AssertionError as e:
                 failures.append((f"count:{theme}:{count}", str(e)))
                 print(f"  FAILED: {e}")
+
+    # Mixed-size pieces (regression for 3x3-read-as-2x2)
+    for theme in ("blue", "brown", "pink"):
+        try:
+            run_mixed_size_pieces(theme)
+        except AssertionError as e:
+            failures.append((f"mixed-pieces:{theme}", str(e)))
+            print(f"  FAILED: {e}")
 
     # Partial-fit solver behavior
     try:

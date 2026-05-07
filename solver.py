@@ -261,11 +261,29 @@ def detect_pieces(arr: np.ndarray, gb: GridBounds) -> List[Piece]:
         piece_band = piece_band[:3]
     piece_band.sort(key=lambda c: c[0])  # left to right
 
-    # Cell-size search: try a range bracketed by the grid's own cell size
-    # (pieces in the tray are typically 0.4-0.85x the grid cell size) and pick
-    # the size that makes every piece's bbox closest to an integer cell count.
-    raw_dims = [(x1 - x0 + 1, y1 - y0 + 1) for (x0, y0, x1, y1) in piece_band]
-    raw_dims = [(max(1, w - 14), max(1, h - 14)) for (w, h) in raw_dims]
+    # Tighten each piece bbox to the true (un-dilated) brick pixels before
+    # determining cell size. Using the dilated bbox here would leave ~16 px of
+    # halo padding, which biases the search toward a larger cell size and
+    # makes 3x3 pieces read as 2x2.
+    pieces_data: List[Tuple[np.ndarray, int, int]] = []  # (sub, true_w, true_h)
+    for (x0, y0, x1, y1) in piece_band:
+        ay0 = region_top + y0
+        ay1 = region_top + y1
+        sub_full = not_page_full[ay0:ay1 + 1, x0:x1 + 1]
+        ys, xs = np.where(sub_full)
+        if len(ys) == 0:
+            continue
+        py0, py1 = ys.min(), ys.max()
+        px0, px1 = xs.min(), xs.max()
+        sub = sub_full[py0:py1 + 1, px0:px1 + 1]
+        ph, pw = sub.shape
+        pieces_data.append((sub, pw, ph))
+
+    if not pieces_data:
+        raise ValueError("Detected piece bounds but couldn't find any pixels.")
+
+    # Cell-size search across plausible piece-cell sizes. Pieces in the tray
+    # are typically 0.30-0.95x of the grid cell size.
     cs_min = max(12, int(gb.cell_h * 0.30))
     cs_max = max(cs_min + 1, int(gb.cell_h * 0.95))
 
@@ -273,36 +291,25 @@ def detect_pieces(arr: np.ndarray, gb: GridBounds) -> List[Piece]:
     for cs in range(cs_min, cs_max + 1):
         err = 0.0
         ok = True
-        for (w, h) in raw_dims:
-            cw = w / cs
-            ch = h / cs
+        for (_sub, pw, ph) in pieces_data:
+            cw = pw / cs
+            ch = ph / cs
             if cw < 0.7 or ch < 0.7 or cw > 5.5 or ch > 5.5:
                 ok = False; break
             err += (cw - round(cw)) ** 2 + (ch - round(ch)) ** 2
-        if ok and err < best_err:
-            best_err, best_cs = err, cs
+        # Smaller cs == more cells per piece == finer-grained detection. On a
+        # near-tie, prefer the smaller cs by giving the larger cs a tiny
+        # penalty proportional to itself.
+        adjusted = err + cs * 1e-5
+        if ok and adjusted < best_err:
+            best_err, best_cs = adjusted, cs
     if best_cs is None:
         raise ValueError("Could not determine piece cell size.")
 
     pieces: List[Piece] = []
-    for idx, (x0, y0, x1, y1) in enumerate(piece_band):
-        # Use original (un-dilated) not-page pixels inside this piece's bbox.
-        ay0 = region_top + y0
-        ay1 = region_top + y1
-        sub = not_page_full[ay0:ay1 + 1, x0:x1 + 1]
-
-        # Tight bbox around the true (un-dilated) piece pixels.
-        ys, xs = np.where(sub)
-        if len(ys) == 0:
-            continue
-        py0, py1 = ys.min(), ys.max()
-        px0, px1 = xs.min(), xs.max()
-        sub = sub[py0:py1 + 1, px0:px1 + 1]
-        ph, pw = sub.shape
-
+    for sub, pw, ph in pieces_data:
         rows = max(1, round(ph / best_cs))
         cols = max(1, round(pw / best_cs))
-
         cell_h_p = ph / rows
         cell_w_p = pw / cols
 
